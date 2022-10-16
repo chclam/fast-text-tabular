@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import time
+import os
 import numpy as np
 import pandas as pd
 import openml
@@ -9,10 +10,13 @@ from sklearn.model_selection import train_test_split
 from sklearn.model_selection import cross_val_score
 from sklearn.datasets import load_breast_cancer
 from sklearn.preprocessing import LabelEncoder
-from fasttextclassifier import FastTextClassifier
+from gama.configuration.fasttextclassifier import FastTextClassifier
 from gama import GamaClassifier
 from gama.search_methods.asha import AsynchronousSuccessiveHalving
 from sklearn.metrics import roc_auc_score, make_scorer, roc_curve
+from gama.postprocessing.ensemble import EnsemblePostProcessing
+from sklearn.metrics import roc_auc_score
+from imblearn.over_sampling import RandomOverSampler
 
 def remove_non_string_cols(X):
   # Only keep the columns with string values
@@ -21,15 +25,15 @@ def remove_non_string_cols(X):
 
 def fasttext_run(X, y):
   #y = pd.Series(LabelEncoder().fit_transform(y), index=y.index)
+  X = remove_non_string_cols(X)
   if isinstance(y, np.ndarray):
     y = pd.Series(LabelEncoder().fit_transform(y))
   else:
     y = pd.Series(LabelEncoder().fit_transform(y), index=y.index)
   X_train, X_test, y_train, y_test = train_test_split(X, y, stratify=y, random_state=0)
 
-  X = remove_non_string_cols(X)
-  clf = FastTextClassifier(minn=3, maxn=6, epoch=10, lr=0.3)
-  clf.set_classes(y.unique())
+  clf = FastTextClassifier(minn=0, maxn=0, epoch=5, lr=0.1)
+  clf.classes_ = y.unique()
   score = cross_val_score(clf, X_train, y_train, 
                           cv=2,
                           scoring=make_scorer(roc_auc_score, needs_proba=True, multi_class="ovr", average="macro", labels=sorted(y.unique())),
@@ -40,13 +44,16 @@ def fasttext_run(X, y):
   return avg_score
 
 def gama_run(X, y):
-  X_train, X_test, y_train, y_test = train_test_split(X, y, stratify=y, random_state=0)   
-  from sklearn.metrics import roc_auc_score
-  from functools import partial
-  automl = GamaClassifier(max_total_time=600, store="logs", max_eval_time=240,
-                          search=AsynchronousSuccessiveHalving(), 
-                          scoring="roc_auc_ovr"
-                          )
+  X_train, X_test, y_train, y_test = train_test_split(X, y, stratify=y, random_state=0)
+  if min(y_train.value_counts()) < 10:
+    ros = RandomOverSampler(sampling_strategy="minority")
+    X_train, y_train = ros.fit_resample(X_train, y_train)
+  automl = GamaClassifier(max_total_time=600,
+    store="logs",
+    max_eval_time=240,
+    post_processing=EnsemblePostProcessing(),
+    scoring="roc_auc_ovr"
+  )
   print("Starting to fit.")
   automl.fit(X_train, y_train)
   #label_predictions = automl.predict(X_test)
@@ -81,31 +88,33 @@ def main(ids):
         y = X["state"]
         del X["state"]
       # Cap to 100.000 instances
-      X = X[:100000]
-      y = y[:100000]
+      if len(X) > 100000:
+        X, _, y, _ = train_test_split(X, y, stratify=y, train_size=100000, random_state=0)
     except Exception as e:
       msg = f"{d_id} openml failed: {e}\n"
       print(msg)
       log_error(msg)
 
-    try:
-      dataset_scores["fasttext"] = fasttext_run(X, y)
-    except Exception as e:
-      msg = f"{d_id} fasttext failed: {e}\n"
-      print(msg)
-      log_error(msg)
-
 #    try:
-#      dataset_scores["gama"] = gama_run(X, y)
+#      dataset_scores["fasttext"] = fasttext_run(X, y)
 #    except Exception as e:
-#      msg = f"{d_id} GAMA failed: {e}\n"
+#      msg = f"{d_id} fasttext failed: {e}\n"
 #      print(msg)
 #      log_error(msg)
+
+    try:
+      dataset_scores["gama"] = gama_run(X, y)
+    except Exception as e:
+      msg = f"{d_id} GAMA failed: {e}\n"
+      print(msg)
+      log_error(msg)
 
     scores.append(dataset_scores)
 
   try:
-    with open(f"GAMA_AUC_full_results_{int(time.time())}.json", "w+") as f:
+    if not os.path.isdir("roc_results"):
+      os.mkdir("roc_results")
+    with open(f"roc_results/results_{int(time.time())}.json", "w+") as f:
       json.dump(scores, f)
   except Exception as e:
     print(e)
@@ -122,6 +131,6 @@ if __name__ == "__main__":
     "openpayments": 42738,
   }
 
-  for _ in range(1):
+  for _ in range(5):
     main(ids)
 
